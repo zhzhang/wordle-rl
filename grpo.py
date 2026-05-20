@@ -92,9 +92,9 @@ def _gather_token_logprobs(
     model,
     tokens: torch.Tensor,
     target_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward `tokens` through `model` and return per-token logprobs of the
-    realized tokens together with the alignment mask.
+    realized tokens together with the alignment mask and per-token entropy.
 
     Logits at position `t` predict the token at position `t + 1`, so we shift
     inputs/targets/masks accordingly.
@@ -103,6 +103,8 @@ def _gather_token_logprobs(
         logprobs: shape [T-1], logprob of the realized next token at each
             position whose mask is 1.
         mask: shape [T-1], the shifted target mask (1 = train on this token).
+        entropy: shape [T-1], entropy of the policy distribution at each
+            position (in nats).
     """
     input_ids = tokens.unsqueeze(0)  # [1, T]
     outputs = model(input_ids=input_ids, use_cache=False)
@@ -114,7 +116,10 @@ def _gather_token_logprobs(
 
     log_probs = F.log_softmax(shift_logits.float(), dim=-1)
     token_logprobs = log_probs.gather(-1, shift_targets.unsqueeze(-1)).squeeze(-1)
-    return token_logprobs, shift_mask
+    # H(p) = -sum_v p(v) * log p(v); computed from log_probs in a numerically
+    # stable way as -sum_v exp(log p) * log p.
+    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    return token_logprobs, shift_mask, entropy
 
 
 def grpo_step(
@@ -139,6 +144,7 @@ def grpo_step(
     total_ratio_acc = 0.0
     total_clip_frac_acc = 0.0
     total_kl_acc = 0.0
+    total_entropy_acc = 0.0
 
     # Pre-compute denominator (total trainable tokens across the group) so
     # each token contributes the same amount to the final loss regardless of
@@ -158,7 +164,7 @@ def grpo_step(
             rollout.sample_logprobs, dtype=torch.float32, device=device
         )
 
-        new_logprobs, shift_mask = _gather_token_logprobs(model, tokens, mask)
+        new_logprobs, shift_mask, entropy = _gather_token_logprobs(model, tokens, mask)
         # `old_logprobs_full[i]` is the logprob with which the sampler chose
         # `tokens[i]` (the token *at* position i). The new_logprobs returned
         # above are aligned to predict `tokens[i+1]` at index `i`. To match
@@ -193,13 +199,16 @@ def grpo_step(
             total_clip_frac_acc += float((clipped_flag * loss_mask).sum().item())
             # Approximate KL = E[ -log_ratio ] for diagnostics only.
             total_kl_acc += float((-log_ratio * loss_mask).sum().item())
+            total_entropy_acc += float((entropy * loss_mask).sum().item())
             total_tokens += int(tok_count.item())
 
-    if config.max_grad_norm is not None:
-        torch.nn.utils.clip_grad_norm_(
-            (p for p in model.parameters() if p.requires_grad),
-            config.max_grad_norm,
-        )
+    # `clip_grad_norm_` returns the total norm of trainable params *before*
+    # clipping, which is exactly the diagnostic we want to log. When clipping
+    # is disabled we pass `inf` so no clipping happens but we still get the
+    # norm back.
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    clip_value = config.max_grad_norm if config.max_grad_norm is not None else float("inf")
+    grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, clip_value)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
@@ -209,6 +218,7 @@ def grpo_step(
         "mean_ratio": total_ratio_acc / n,
         "clip_frac": total_clip_frac_acc / n,
         "approx_kl": total_kl_acc / n,
+        "entropy": total_entropy_acc / n,
+        "grad_norm": float(grad_norm),
         "trained_tokens": float(total_tokens),
-        "grand_total_tokens": float(grand_total),
     }
