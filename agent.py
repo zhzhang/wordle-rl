@@ -1,8 +1,9 @@
 import re
 import textwrap
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
-import torch
+from vllm import SamplingParams
 
 from game import pick_word, score_guess
 
@@ -25,6 +26,19 @@ class RunResult(NamedTuple):
     score: int
 
 
+@dataclass
+class _RolloutState:
+    rollout_idx: int
+    word: str
+    messages: list[dict[str, str]]
+    tokens: list[int] = field(default_factory=list)
+    mask: list[int] = field(default_factory=list)
+    total_correct: int = 0
+    total_present: int = 0
+    score: int = 0
+    done: bool = False
+
+
 def _format_feedback(guess: str, scores: list[str]) -> str:
     return " ".join(f"{g.upper()}:{s}" for g, s in zip(guess, scores))
 
@@ -37,80 +51,137 @@ def _extract_guess(text: str) -> str | None:
     return words[-1].lower() if words else None
 
 
-def run_agent(model, tokenizer, target: str | None = None) -> RunResult:
-    word = target if target is not None else pick_word()
+def _render_prompt(tokenizer, msgs: list[dict[str, str]]) -> tuple[str, list[int]]:
+    prompt_text = tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    return prompt_text, prompt_ids
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "Make your first guess."},
-    ]
 
-    def _render(msgs) -> list[int]:
-        text = tokenizer.apply_chat_template(
-            msgs,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
+def _extend_with_context_delta(state: _RolloutState, prompt_ids: list[int]) -> None:
+    if not state.tokens:
+        state.tokens = list(prompt_ids)
+        state.mask = [0] * len(prompt_ids)
+        return
+
+    prefix_len = 0
+    max_prefix_len = min(len(state.tokens), len(prompt_ids))
+    while prefix_len < max_prefix_len and state.tokens[prefix_len] == prompt_ids[prefix_len]:
+        prefix_len += 1
+
+    if prefix_len < len(state.tokens):
+        return
+
+    added = prompt_ids[prefix_len:]
+    if added:
+        state.tokens.extend(added)
+        state.mask.extend([0] * len(added))
+
+
+def run_rollouts(llm, tokenizer, num_rollouts: int, targets: list[str] | None = None) -> list[RunResult]:
+    if num_rollouts <= 0:
+        return []
+    if targets is not None and len(targets) != num_rollouts:
+        raise ValueError("targets must be None or have length equal to num_rollouts")
+
+    states: list[_RolloutState] = []
+    for i in range(num_rollouts):
+        word = targets[i] if targets is not None else pick_word()
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Make your first guess."},
+        ]
+        _, prompt_ids = _render_prompt(tokenizer, messages)
+        states.append(
+            _RolloutState(
+                rollout_idx=i,
+                word=word,
+                messages=messages,
+                tokens=list(prompt_ids),
+                mask=[0] * len(prompt_ids),
+            )
         )
-        return tokenizer.encode(text, add_special_tokens=False)
 
-    tokens: list[int] = _render(messages)
-    mask: list[int] = [0] * len(tokens)
-
-    total_correct = 0
-    total_present = 0
+    sampling_params = SamplingParams(max_tokens=512, temperature=1.0)
 
     for attempt_num in range(1, MAX_ATTEMPTS + 1):
-        input_ids = torch.tensor([tokens], device=model.device)
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=512,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        new_generated = output_ids[0][len(tokens):].tolist()
-        tokens.extend(new_generated)
-        mask.extend([1] * len(new_generated))
-
-        response = tokenizer.decode(new_generated, skip_special_tokens=False)
-        think_match = re.search(r"<think>.*?</think>(.*)", response, re.DOTALL)
-        answer_text = (think_match.group(1) if think_match else response).strip()
-
-        guess = _extract_guess(answer_text)
-        if guess is None:
-            print(f"Attempt {attempt_num}: could not parse a 5-letter guess. Run failed.")
-            return RunResult(tokens, mask, 0)
-
-        try:
-            scores = score_guess(word, guess)
-        except ValueError as exc:
-            print(f"Attempt {attempt_num}: invalid guess '{guess}' ({exc}). Run failed.")
-            return RunResult(tokens, mask, 0)
-
-        total_correct += sum(1 for s in scores if s == "correct")
-        total_present += sum(1 for s in scores if s == "present")
-
-        feedback = _format_feedback(guess, scores)
-        print(f"Attempt {attempt_num}: {guess.upper()} -> {feedback}")
-
-        if all(s == "correct" for s in scores):
-            unused = MAX_ATTEMPTS - attempt_num
-            score = 12 * (unused + 1)
-            print(f"Solved in {attempt_num} attempt(s). Word: {word.upper()}. Score: {score}")
-            return RunResult(tokens, mask, score)
-
-        if attempt_num == MAX_ATTEMPTS:
+        active_states = [s for s in states if not s.done]
+        if not active_states:
             break
 
-        # Append the feedback turn; use the tokenizer to render it correctly.
-        messages.append({"role": "assistant", "content": answer_text})
-        messages.append({"role": "user", "content": f"Feedback: {feedback}\nMake your next guess."})
-        new_context = _render(messages)
-        added = new_context[len(tokens):]
-        tokens.extend(added)
-        mask.extend([0] * len(added))
+        prompts: list[str] = []
+        for state in active_states:
+            prompt_text, prompt_ids = _render_prompt(tokenizer, state.messages)
+            _extend_with_context_delta(state, prompt_ids)
+            prompts.append(prompt_text)
 
-    score = 2 * total_correct + total_present
-    print(f"Out of attempts. Word: {word.upper()}. Score: {score}")
-    return RunResult(tokens, mask, score)
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+
+        for state, output in zip(active_states, outputs):
+            generated_ids = output.outputs[0].token_ids
+            state.tokens.extend(generated_ids)
+            state.mask.extend([1] * len(generated_ids))
+
+            response = output.outputs[0].text
+            think_match = re.search(r"<think>.*?</think>(.*)", response, re.DOTALL)
+            answer_text = (think_match.group(1) if think_match else response).strip()
+
+            guess = _extract_guess(answer_text)
+            if guess is None:
+                print(
+                    f"Rollout {state.rollout_idx + 1} attempt {attempt_num}: "
+                    "could not parse a 5-letter guess. Run failed."
+                )
+                state.score = 0
+                state.done = True
+                continue
+
+            try:
+                scores = score_guess(state.word, guess)
+            except ValueError as exc:
+                print(
+                    f"Rollout {state.rollout_idx + 1} attempt {attempt_num}: "
+                    f"invalid guess '{guess}' ({exc}). Run failed."
+                )
+                state.score = 0
+                state.done = True
+                continue
+
+            state.total_correct += sum(1 for s in scores if s == "correct")
+            state.total_present += sum(1 for s in scores if s == "present")
+
+            feedback = _format_feedback(guess, scores)
+            print(f"Rollout {state.rollout_idx + 1} attempt {attempt_num}: {guess.upper()} -> {feedback}")
+
+            if all(s == "correct" for s in scores):
+                unused = MAX_ATTEMPTS - attempt_num
+                state.score = 12 * (unused + 1)
+                state.done = True
+                print(
+                    f"Rollout {state.rollout_idx + 1} solved in {attempt_num} attempt(s). "
+                    f"Word: {state.word.upper()}. Score: {state.score}"
+                )
+                continue
+
+            if attempt_num == MAX_ATTEMPTS:
+                state.score = 2 * state.total_correct + state.total_present
+                state.done = True
+                print(
+                    f"Rollout {state.rollout_idx + 1} out of attempts. "
+                    f"Word: {state.word.upper()}. Score: {state.score}"
+                )
+                continue
+
+            state.messages.append({"role": "assistant", "content": response.strip()})
+            state.messages.append({"role": "user", "content": f"Feedback: {feedback}\nMake your next guess."})
+
+    return [RunResult(tokens=s.tokens, mask=s.mask, score=s.score) for s in states]
+
+
+def run_agent(llm, tokenizer, target: str | None = None) -> RunResult:
+    targets = [target] if target is not None else None
+    return run_rollouts(llm, tokenizer, num_rollouts=1, targets=targets)[0]
