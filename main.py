@@ -1,5 +1,8 @@
+from agent import run_agent
+
+
 def main():
-    print("Hello from wordle-rl!")
+    run_agent()
 
 
 if __name__ == "__main__":
