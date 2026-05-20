@@ -1,35 +1,27 @@
 import argparse
 import gc
+import multiprocessing as mp
 import os
 import shutil
 import statistics
 import time
 import traceback
 
+# The system driver lives at /usr/lib/x86_64-linux-gnu/libcuda.so.1 but
+# isn't indexed in the local ldconfig cache, so triton (used internally by
+# torch and by vLLM) fails its `libcuda.so` probe. Pointing it explicitly
+# at the multiarch dir works around that without requiring sudo to refresh
+# the linker cache. This must be set before torch/triton import.
+os.environ.setdefault("TRITON_LIBCUDA_PATH", "/usr/lib/x86_64-linux-gnu")
+
 import torch
 import wandb
 from transformers import AutoTokenizer
 
-from agent import run_rollouts
 from grpo import GRPOConfig, _normalize_advantages, grpo_step, load_policy
+from rollout_worker import worker_main
 
 MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
-
-
-def _free_vllm(llm) -> None:
-    """Best-effort teardown of a vLLM engine to free GPU memory."""
-    try:
-        shutdown = getattr(llm, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
-    except Exception as exc:
-        print(f"(vLLM shutdown raised: {exc!r}; continuing)")
-
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
 
 def _report_mem(tag: str) -> None:
@@ -40,85 +32,158 @@ def _report_mem(tag: str) -> None:
     print(f"[mem/{tag}] allocated={alloc:.2f}GB reserved={reserved:.2f}GB")
 
 
-def _spawn_vllm(model_path: str, args):
-    """Construct a fresh vLLM engine pointing at `model_path`."""
-    from vllm import LLM
+class _SnapshotSaver:
+    """Persist the policy (base + merged LoRA delta) as a vanilla Qwen3
+    checkpoint on disk so the rollout worker can hot-reload it.
 
-    return LLM(
-        model=model_path,
-        dtype="bfloat16" if torch.cuda.is_available() else "float32",
-        gpu_memory_utilization=args.vllm_mem,
-        enforce_eager=True,
-        max_model_len=args.max_model_len,
-    )
+    Caches a CPU copy of the base weights on first use, since:
+      * the base weights never change due to LoRA training, so a single
+        snapshot is a sufficient restore source;
+      * restoring from the CPU snapshot after `merge_adapter` avoids the
+        bf16 round-off that `merge` -> `unmerge` would otherwise accumulate
+        across many sync iterations.
 
-
-def _save_snapshot(model, tokenizer, snapshot_dir: str) -> None:
-    """Persist the current policy (base + merged LoRA delta) to disk so a
-    fresh vLLM engine can load it as a plain Qwen3 checkpoint.
-
-    Steps:
-        1. Cache the *un-merged* base parameters to CPU. We use this to
-           restore the model after saving so repeated merge/unmerge cycles
-           do not accumulate bf16 round-off error.
-        2. Clobber any prior snapshot at `snapshot_dir`.
-        3. `model.merge_adapter()` fuses the LoRA delta into
-           `base_layer.weight` in place.
-        4. Build a clean state_dict whose keys match the unwrapped Qwen3
-           model (no `.base_layer.`, no `lora_A`/`lora_B` entries).
-        5. Hand the state_dict to `save_pretrained` so HF takes care of
-           sharding, tied-weight handling, config, and generation_config.
-        6. Restore the cached base weights from CPU.
+    Avoiding the per-iter CPU clone of an ~8GB base is essential for
+    making `sync_every == 1` practical.
     """
-    base = model.get_base_model()
-    base_device = next(base.parameters()).device
 
-    base_snapshot = {
-        k: v.detach().to("cpu", copy=True)
-        for k, v in base.state_dict().items()
-        if ".lora_A." not in k and ".lora_B." not in k
-    }
+    def __init__(self, policy):
+        self._base = policy.get_base_model()
+        self._device = next(self._base.parameters()).device
+        self._base_cpu = {
+            k: v.detach().to("cpu", copy=True)
+            for k, v in self._base.state_dict().items()
+            if ".lora_A." not in k and ".lora_B." not in k
+        }
 
-    if os.path.isdir(snapshot_dir):
-        shutil.rmtree(snapshot_dir)
-    os.makedirs(snapshot_dir, exist_ok=True)
+    def save(self, policy, tokenizer, out_dir: str) -> None:
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
 
-    model.merge_adapter()
-    try:
-        clean_state = {}
-        for k, v in base.state_dict().items():
-            if ".lora_A." in k or ".lora_B." in k:
-                continue
-            clean_state[k.replace(".base_layer.", ".")] = v.detach()
+        policy.merge_adapter()
+        try:
+            clean_state = {}
+            for k, v in self._base.state_dict().items():
+                if ".lora_A." in k or ".lora_B." in k:
+                    continue
+                clean_state[k.replace(".base_layer.", ".")] = v.detach()
 
-        base.save_pretrained(
-            snapshot_dir,
-            state_dict=clean_state,
-            safe_serialization=True,
-        )
-        tokenizer.save_pretrained(snapshot_dir)
-    finally:
-        with torch.no_grad():
-            base.load_state_dict(
-                {k: v.to(base_device) for k, v in base_snapshot.items()},
-                strict=False,
+            self._base.save_pretrained(
+                out_dir,
+                state_dict=clean_state,
+                safe_serialization=True,
             )
-        del base_snapshot
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            tokenizer.save_pretrained(out_dir)
+        finally:
+            with torch.no_grad():
+                self._base.load_state_dict(
+                    {k: v.to(self._device) for k, v in self._base_cpu.items()},
+                    strict=False,
+                )
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+class RolloutWorker:
+    """Parent-side handle to the vLLM rollout subprocess.
+
+    The worker process owns a vLLM engine pinned to a dedicated GPU and
+    services rollout + weight-reload requests over a Pipe.
+    """
+
+    def __init__(
+        self,
+        *,
+        gpu_id: int,
+        model_id: str,
+        gpu_memory_utilization: float,
+        max_model_len: int,
+    ):
+        ctx = mp.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        self._proc = ctx.Process(
+            target=worker_main,
+            args=(child_conn,),
+            kwargs={
+                "gpu_id": gpu_id,
+                "model_id": model_id,
+                "gpu_memory_utilization": gpu_memory_utilization,
+                "max_model_len": max_model_len,
+            },
+            daemon=False,
+        )
+        self._conn = parent_conn
+        self._proc.start()
+        # vLLM cold start can take a minute or so; block here until the
+        # child reports `ready` (or an explicit error).
+        status, payload = self._conn.recv()
+        if status != "ready":
+            raise RuntimeError(f"Rollout worker failed to start: {payload!r}")
+
+    def rollouts(self, num_rollouts: int, max_tokens: int, targets=None):
+        self._conn.send((
+            "rollouts",
+            {
+                "num_rollouts": num_rollouts,
+                "targets": targets,
+                "max_tokens": max_tokens,
+            },
+        ))
+        status, payload = self._conn.recv()
+        if status != "ok":
+            raise RuntimeError(f"rollouts failed: {payload!r}")
+        return payload
+
+    def reload_weights(self, snapshot_dir: str) -> None:
+        self._conn.send(("reload_weights", {"snapshot_dir": snapshot_dir}))
+        status, payload = self._conn.recv()
+        if status != "ok":
+            raise RuntimeError(f"reload_weights failed: {payload!r}")
+
+    def shutdown(self) -> None:
+        try:
+            self._conn.send(("shutdown", {}))
+            try:
+                self._conn.recv()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._proc.join(timeout=20)
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=5)
+        if self._proc.is_alive():
+            self._proc.kill()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-rollouts", type=int, default=16)
+    parser.add_argument(
+        "--num-rollout-groups", type=int, default=4,
+        help=(
+            "Number of rollout groups to collect per iteration. Each group "
+            "is a fresh batch of `--num-rollouts` rollouts; advantages are "
+            "z-scored within each group (preserving GRPO's per-group "
+            "baseline), then gradients are accumulated across all groups "
+            "before a single optimizer step. Use this to scale effective "
+            "batch size without breaking the GRPO group-relative baseline."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument(
-        "--vllm-mem", type=float, default=0.30,
+        "--vllm-mem", type=float, default=0.85,
         help=(
-            "gpu_memory_utilization for vLLM. Kept low so the HF policy and "
-            "optimizer can share the GPU with the rollout engine."
+            "gpu_memory_utilization for vLLM on its dedicated GPU. With the "
+            "rollout engine on its own card we can give it most of the VRAM."
         ),
     )
     parser.add_argument(
@@ -130,16 +195,31 @@ def main() -> None:
         help="vLLM max_model_len; lower this if KV cache fails to fit",
     )
     parser.add_argument(
-        "--snapshot-every", type=int, default=20,
-        help="Refresh the vLLM model from a new HF snapshot every N iterations.",
+        "--sync-every", type=int, default=20,
+        help=(
+            "Hot-reload the rollout engine with freshly-trained weights "
+            "every N iterations. Default 1 (sync after every grpo step)."
+        ),
     )
     parser.add_argument(
         "--snapshot-dir", type=str, default="./vllm_snapshot",
-        help="Path to write/clobber the rolling model snapshot.",
+        help=(
+            "Path to write the rolling merged-policy snapshot before the "
+            "rollout worker hot-reloads it. Putting this on /dev/shm or "
+            "another tmpfs makes snapshotting an order of magnitude faster."
+        ),
     )
     parser.add_argument(
         "--max-iters", type=int, default=0,
         help="Maximum number of iterations (<= 0 means loop forever).",
+    )
+    parser.add_argument(
+        "--train-gpu", type=int, default=0,
+        help="Physical GPU id used by the HF training policy.",
+    )
+    parser.add_argument(
+        "--rollout-gpu", type=int, default=1,
+        help="Physical GPU id used by the vLLM rollout engine.",
     )
     parser.add_argument(
         "--wandb-project", type=str, default="wordle-rl",
@@ -156,6 +236,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        raise RuntimeError(
+            "This training script expects at least two CUDA GPUs: one for "
+            "the HF training policy and one for the vLLM rollout engine. "
+            f"Detected {torch.cuda.device_count()} GPU(s)."
+        )
+    if args.train_gpu == args.rollout_gpu:
+        raise ValueError(
+            "--train-gpu and --rollout-gpu must point at different physical "
+            f"GPUs (got both == {args.train_gpu})."
+        )
+
+    # The training process keeps the full CUDA topology visible so the HF
+    # policy can land on `train_gpu`. The rollout worker masks
+    # CUDA_VISIBLE_DEVICES inside its own process so vLLM only sees
+    # `rollout_gpu`.
+    torch.cuda.set_device(args.train_gpu)
+
     wandb_mode = args.wandb_mode
     if wandb_mode == "online" and not os.environ.get("WANDB_API_KEY"):
         # Don't crash an overnight run because the key wasn't exported. Fall
@@ -167,6 +265,12 @@ def main() -> None:
         )
         wandb_mode = "offline"
 
+    if args.num_rollout_groups < 1:
+        raise ValueError(
+            "--num-rollout-groups must be >= 1 "
+            f"(got {args.num_rollout_groups})."
+        )
+
     wandb.init(
         project=args.wandb_project,
         name=args.wandb_run_name,
@@ -174,23 +278,38 @@ def main() -> None:
         config={
             "model_id": MODEL_ID,
             "num_rollouts": args.num_rollouts,
+            "num_rollout_groups": args.num_rollout_groups,
+            "effective_batch_size": args.num_rollouts * args.num_rollout_groups,
             "lr": args.lr,
             "clip_eps": args.clip_eps,
             "vllm_mem": args.vllm_mem,
             "max_rollout_tokens": args.max_rollout_tokens,
             "max_model_len": args.max_model_len,
-            "snapshot_every": args.snapshot_every,
+            "sync_every": args.sync_every,
             "snapshot_dir": args.snapshot_dir,
+            "train_gpu": args.train_gpu,
+            "rollout_gpu": args.rollout_gpu,
         },
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-    print("=== Loading vLLM (initial: base model) ===")
-    llm = _spawn_vllm(MODEL_ID, args)
-    _report_mem("after_vllm_load")
+    print(
+        f"=== Spawning vLLM rollout worker on GPU {args.rollout_gpu} "
+        f"(this may take a minute) ===",
+        flush=True,
+    )
+    rollout_worker = RolloutWorker(
+        gpu_id=args.rollout_gpu,
+        model_id=MODEL_ID,
+        gpu_memory_utilization=args.vllm_mem,
+        max_model_len=args.max_model_len,
+    )
 
-    print("\n=== Loading HF training policy (LoRA) ===")
+    print(
+        f"\n=== Loading HF training policy (LoRA) on GPU {args.train_gpu} ===",
+        flush=True,
+    )
     cfg = GRPOConfig(lr=args.lr, clip_eps=args.clip_eps)
     policy = load_policy(MODEL_ID, cfg)
     optimizer = torch.optim.AdamW(
@@ -199,9 +318,13 @@ def main() -> None:
     )
     _report_mem("after_policy_load")
 
+    print("\n=== Caching base weights on CPU for snapshot restore ===", flush=True)
+    saver = _SnapshotSaver(policy)
+    _report_mem("after_snapshot_saver")
+
     print("\n=== Training loop ===", flush=True)
     iteration = 0
-    last_snapshot_iter = 0
+    last_sync_iter = 0
     try:
         while True:
             iteration += 1
@@ -209,19 +332,32 @@ def main() -> None:
                 break
 
             try:
+                # Collect `num_rollout_groups` independent groups. Each group
+                # gets its own z-scored advantages (the per-group GRPO
+                # baseline), then we hand the concatenated batch to
+                # `grpo_step`, which `.backward()`s each rollout in sequence
+                # and only calls `optimizer.step()` after the full batch --
+                # i.e. gradients accumulate across groups.
                 t0 = time.time()
-                rollouts = run_rollouts(
-                    llm,
-                    tokenizer,
-                    num_rollouts=args.num_rollouts,
-                    max_tokens=args.max_rollout_tokens,
-                )
-                scores = [r.score for r in rollouts]
-                advantages = _normalize_advantages(scores)
+                all_rollouts = []
+                all_advantages: list[float] = []
+                group_scores: list[list[int]] = []
+                for _ in range(args.num_rollout_groups):
+                    group = rollout_worker.rollouts(
+                        num_rollouts=args.num_rollouts,
+                        max_tokens=args.max_rollout_tokens,
+                    )
+                    g_scores = [r.score for r in group]
+                    g_advs = _normalize_advantages(g_scores)
+                    all_rollouts.extend(group)
+                    all_advantages.extend(g_advs)
+                    group_scores.append(g_scores)
                 rollout_dt = time.time() - t0
 
                 t1 = time.time()
-                metrics = grpo_step(policy, optimizer, rollouts, advantages, cfg)
+                metrics = grpo_step(
+                    policy, optimizer, all_rollouts, all_advantages, cfg
+                )
                 train_dt = time.time() - t1
             except Exception as exc:
                 # Resilience: never let a single bad iteration kill the run.
@@ -236,14 +372,25 @@ def main() -> None:
                     torch.cuda.empty_cache()
                 continue
 
+            scores = [s for gs in group_scores for s in gs]
             score_mean = statistics.fmean(scores) if scores else 0.0
             score_std = statistics.pstdev(scores) if len(scores) > 1 else 0.0
             score_min = min(scores) if scores else 0
             score_max = max(scores) if scores else 0
-            tokens_per_rollout = [int(sum(r.mask)) for r in rollouts]
+            tokens_per_rollout = [int(sum(r.mask)) for r in all_rollouts]
             tokens_mean = statistics.fmean(tokens_per_rollout) if tokens_per_rollout else 0.0
-            adv_mean = statistics.fmean(advantages) if advantages else 0.0
-            adv_std = statistics.pstdev(advantages) if len(advantages) > 1 else 0.0
+            adv_mean = statistics.fmean(all_advantages) if all_advantages else 0.0
+            adv_std = statistics.pstdev(all_advantages) if len(all_advantages) > 1 else 0.0
+            # Spread of per-group mean scores -- if this is small, the
+            # multi-group batch is just adding samples around the same
+            # baseline; if it's large, different groups are exploring very
+            # different regions of the score distribution.
+            group_means = [
+                statistics.fmean(gs) if gs else 0.0 for gs in group_scores
+            ]
+            group_mean_std = (
+                statistics.pstdev(group_means) if len(group_means) > 1 else 0.0
+            )
 
             log_dict = {
                 "iter": iteration,
@@ -258,21 +405,29 @@ def main() -> None:
                 "score/std": score_std,
                 "score/min": score_min,
                 "score/max": score_max,
+                "score/group_mean_std": group_mean_std,
                 "advantage/mean": adv_mean,
                 "advantage/std": adv_std,
                 "tokens/per_rollout_mean": tokens_mean,
                 "time/rollout_s": rollout_dt,
                 "time/train_s": train_dt,
-                "iters_since_snapshot": iteration - last_snapshot_iter,
+                "iters_since_sync": iteration - last_sync_iter,
+                "groups/num": args.num_rollout_groups,
+                "groups/effective_batch_size": len(all_rollouts),
             }
             if torch.cuda.is_available():
                 log_dict["mem/allocated_gb"] = torch.cuda.memory_allocated() / 1e9
                 log_dict["mem/reserved_gb"] = torch.cuda.memory_reserved() / 1e9
             wandb.log(log_dict, step=iteration)
 
+            scores_repr = (
+                f"scores={scores}"
+                if args.num_rollout_groups == 1
+                else f"groups={group_scores}"
+            )
             print(
                 f"[iter {iteration:>4}] "
-                f"scores={scores} "
+                f"{scores_repr} "
                 f"loss={metrics['loss']:+.4f} "
                 f"ratio={metrics['mean_ratio']:.3f} "
                 f"clip_frac={metrics['clip_frac']:.3f} "
@@ -282,48 +437,51 @@ def main() -> None:
                 flush=True,
             )
 
-            if iteration % args.snapshot_every == 0:
-                print(
-                    f"\n--- Snapshot @ iter {iteration}: "
-                    f"refreshing vLLM from latest policy ---",
-                    flush=True,
-                )
-                snap_t = time.time()
+            if args.sync_every > 0 and iteration % args.sync_every == 0:
+                sync_t = time.time()
                 try:
-                    # Free the engine first so the on-disk snapshot can be
-                    # reloaded cleanly and the CPU snapshot doesn't crowd the
-                    # GPU with two model copies.
-                    _free_vllm(llm)
-                    _save_snapshot(policy, tokenizer, args.snapshot_dir)
+                    save_t = time.time()
+                    saver.save(policy, tokenizer, args.snapshot_dir)
+                    save_dt = time.time() - save_t
                     _report_mem("after_save_snapshot")
-                    llm = _spawn_vllm(args.snapshot_dir, args)
-                    _report_mem("after_vllm_reload")
-                    snap_dt = time.time() - snap_t
-                    last_snapshot_iter = iteration
+
+                    reload_t = time.time()
+                    rollout_worker.reload_weights(args.snapshot_dir)
+                    reload_dt = time.time() - reload_t
+
+                    sync_dt = time.time() - sync_t
+                    last_sync_iter = iteration
                     wandb.log(
                         {
                             "iter": iteration,
-                            "snapshot": 1,
-                            "time/snapshot_s": snap_dt,
+                            "sync": 1,
+                            "time/sync_s": sync_dt,
+                            "time/sync_save_s": save_dt,
+                            "time/sync_reload_s": reload_dt,
                         },
                         step=iteration,
                     )
-                    print(f"Snapshot + reload: {snap_dt:.1f}s", flush=True)
+                    print(
+                        f"Sync @ iter {iteration}: "
+                        f"save={save_dt:.1f}s reload={reload_dt:.1f}s "
+                        f"(total {sync_dt:.1f}s)",
+                        flush=True,
+                    )
                 except Exception as exc:
                     print(
-                        f"[snapshot @ iter {iteration}] FAILED: {exc!r}",
+                        f"[sync @ iter {iteration}] FAILED: {exc!r}",
                         flush=True,
                     )
                     traceback.print_exc()
                     wandb.log(
-                        {"iter": iteration, "snapshot_failed": 1},
+                        {"iter": iteration, "sync_failed": 1},
                         step=iteration,
                     )
     except KeyboardInterrupt:
         print("\n(interrupted)", flush=True)
     finally:
         try:
-            _free_vllm(llm)
+            rollout_worker.shutdown()
         except Exception:
             pass
         try:

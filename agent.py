@@ -3,8 +3,6 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from vllm import SamplingParams
-
 from game import pick_word, score_guess
 
 MAX_ATTEMPTS = 6
@@ -118,6 +116,11 @@ def run_rollouts(
                 sample_logprobs=[0.0] * len(prompt_ids),
             )
         )
+
+    # Imported lazily so that callers (e.g. the training process) can use
+    # `RunResult` and `run_rollouts` without dragging vLLM into a process
+    # that does not own a GPU for it.
+    from vllm import SamplingParams
 
     # `logprobs=0` ensures the sampled token's logprob is always returned per position.
     sampling_params = SamplingParams(max_tokens=max_tokens, temperature=1.0, logprobs=0)

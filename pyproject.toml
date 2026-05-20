@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
-    "peft>=0.18.0",
+    "peft>=0.19.0",
     "torch>=2.11.0,<2.12",
     "torchvision>=0.26.0,<0.27",
     "torchaudio>=2.11.0,<2.12",
@@ -15,13 +15,21 @@ dependencies = [
     "wandb>=0.27.0",
 ]
 
+# The host has CUDA 13 (driver 580+). Pin torch to its cu130 build so
+# that `libcudart.so.13` is shipped in the venv -- flashinfer JIT-compiles
+# its sampling kernels against the system CUDA toolkit (13.x here) and
+# refuses to load if the matching libcudart isn't present at runtime.
+#
+# vLLM's published `+cu130` wheel is just the generic (no-cuda-suffix)
+# PyPI wheel that dynamically links against whichever CUDA runtime torch
+# brings along, so simply installing `vllm` from PyPI works once torch
+# is on cu130.
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128" }]
-torchvision = [{ index = "pytorch-cu128" }]
-torchaudio = [{ index = "pytorch-cu128" }]
-vllm = [{ url = "https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cu129-cp38-abi3-manylinux_2_34_x86_64.whl" }]
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]
+torchaudio = [{ index = "pytorch-cu130" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
