@@ -3,16 +3,22 @@ name = "wordle-rl"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
+    "peft>=0.18.0",
     "torch>=2.11.0,<2.12",
+    "torchvision>=0.26.0,<0.27",
+    "torchaudio>=2.11.0,<2.12",
     "transformers>=5.8.1",
-    "vllm>=0.2.5",
+    "vllm>=0.21.0",
 ]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+vllm = [{ url = "https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cu129-cp38-abi3-manylinux_2_34_x86_64.whl" }]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
