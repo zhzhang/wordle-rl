@@ -11,7 +11,6 @@ dependencies = [
     "torchvision>=0.26.0,<0.27",
     "torchaudio>=2.11.0,<2.12",
     "transformers>=5.8.1",
-    "vllm>=0.21.0",
     "wandb>=0.27.0",
 ]
 
@@ -20,10 +19,6 @@ dependencies = [
 # its sampling kernels against the system CUDA toolkit (13.x here) and
 # refuses to load if the matching libcudart isn't present at runtime.
 #
-# vLLM's published `+cu130` wheel is just the generic (no-cuda-suffix)
-# PyPI wheel that dynamically links against whichever CUDA runtime torch
-# brings along, so simply installing `vllm` from PyPI works once torch
-# is on cu130.
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130" }]
 torchvision = [{ index = "pytorch-cu130" }]

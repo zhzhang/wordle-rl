@@ -3,7 +3,10 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from game import pick_word, score_guess
+import torch
+import torch.nn.functional as F
+
+from game import pick_words, score_guess
 
 MAX_ATTEMPTS = 6
 
@@ -86,8 +89,78 @@ def _extend_with_context_delta(state: _RolloutState, prompt_ids: list[int]) -> N
         state.sample_logprobs.extend([0.0] * len(added))
 
 
+def _batched_generate(
+    model,
+    tokenizer,
+    prompt_ids_list: list[list[int]],
+    *,
+    max_new_tokens: int,
+) -> list[tuple[list[int], list[float], str]]:
+    """Generate one turn for each prompt, left-padded into a single batch."""
+    if not prompt_ids_list:
+        return []
+
+    device = next(model.parameters()).device
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+
+    prompt_tensors = [torch.tensor(ids, dtype=torch.long) for ids in prompt_ids_list]
+    max_prompt_len = max(t.size(0) for t in prompt_tensors)
+    batch_size = len(prompt_tensors)
+
+    input_ids = torch.full((batch_size, max_prompt_len), pad_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((batch_size, max_prompt_len), dtype=torch.long, device=device)
+    for i, prompt in enumerate(prompt_tensors):
+        seq_len = prompt.size(0)
+        input_ids[i, max_prompt_len - seq_len:] = prompt
+        attention_mask[i, max_prompt_len - seq_len:] = 1
+
+    prev_use_cache = model.config.use_cache
+    model.config.use_cache = True
+    try:
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=1.0,
+            pad_token_id=pad_id,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+    finally:
+        model.config.use_cache = prev_use_cache
+
+    sequences = outputs.sequences
+    scores = outputs.scores or ()
+
+    results: list[tuple[list[int], list[float], str]] = []
+    for i in range(batch_size):
+        gen_ids = sequences[i, max_prompt_len:].tolist()
+
+        trimmed_ids: list[int] = []
+        gen_logprobs: list[float] = []
+        for step, tok_id in enumerate(gen_ids):
+            if eos_id is not None and tok_id == eos_id:
+                break
+            trimmed_ids.append(tok_id)
+            if step < len(scores):
+                step_logits = scores[step][i]
+                log_probs = F.log_softmax(step_logits.float(), dim=-1)
+                gen_logprobs.append(float(log_probs[tok_id].item()))
+            else:
+                gen_logprobs.append(0.0)
+
+        response = tokenizer.decode(trimmed_ids, skip_special_tokens=False)
+        results.append((trimmed_ids, gen_logprobs, response))
+
+    return results
+
+
 def run_rollouts(
-    llm,
+    model,
     tokenizer,
     num_rollouts: int,
     targets: list[str] | None = None,
@@ -98,9 +171,13 @@ def run_rollouts(
     if targets is not None and len(targets) != num_rollouts:
         raise ValueError("targets must be None or have length equal to num_rollouts")
 
+    if targets is not None:
+        words = list(targets)
+    else:
+        words = pick_words(num_rollouts)
+
     states: list[_RolloutState] = []
-    for i in range(num_rollouts):
-        word = targets[i] if targets is not None else pick_word()
+    for i, word in enumerate(words):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "Make your first guess."},
@@ -117,45 +194,29 @@ def run_rollouts(
             )
         )
 
-    # Imported lazily so that callers (e.g. the training process) can use
-    # `RunResult` and `run_rollouts` without dragging vLLM into a process
-    # that does not own a GPU for it.
-    from vllm import SamplingParams
-
-    # `logprobs=0` ensures the sampled token's logprob is always returned per position.
-    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=1.0, logprobs=0)
-
     for attempt_num in range(1, MAX_ATTEMPTS + 1):
         active_states = [s for s in states if not s.done]
         if not active_states:
             break
 
-        prompts: list[str] = []
+        prompt_ids_list: list[list[int]] = []
         for state in active_states:
-            prompt_text, prompt_ids = _render_prompt(tokenizer, state.messages)
+            _, prompt_ids = _render_prompt(tokenizer, state.messages)
             _extend_with_context_delta(state, prompt_ids)
-            prompts.append(prompt_text)
+            prompt_ids_list.append(list(state.tokens))
 
-        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        batch_outputs = _batched_generate(
+            model,
+            tokenizer,
+            prompt_ids_list,
+            max_new_tokens=max_tokens,
+        )
 
-        for state, output in zip(active_states, outputs):
-            generated_ids = output.outputs[0].token_ids
-            token_logprobs = output.outputs[0].logprobs or []
-            gen_logprobs: list[float] = []
-            for tok_id, pos_logprobs in zip(generated_ids, token_logprobs):
-                if pos_logprobs is None or tok_id not in pos_logprobs:
-                    # Fallback in case the sampled token wasn't recorded.
-                    gen_logprobs.append(0.0)
-                else:
-                    gen_logprobs.append(float(pos_logprobs[tok_id].logprob))
-            if len(gen_logprobs) < len(generated_ids):
-                gen_logprobs.extend([0.0] * (len(generated_ids) - len(gen_logprobs)))
-
+        for state, (generated_ids, gen_logprobs, response) in zip(active_states, batch_outputs):
             state.tokens.extend(generated_ids)
             state.mask.extend([1] * len(generated_ids))
             state.sample_logprobs.extend(gen_logprobs)
 
-            response = output.outputs[0].text
             think_match = re.search(r"<think>.*?</think>(.*)", response, re.DOTALL)
             answer_text = (think_match.group(1) if think_match else response).strip()
 
@@ -219,6 +280,6 @@ def run_rollouts(
     ]
 
 
-def run_agent(llm, tokenizer, target: str | None = None) -> RunResult:
+def run_agent(model, tokenizer, target: str | None = None) -> RunResult:
     targets = [target] if target is not None else None
-    return run_rollouts(llm, tokenizer, num_rollouts=1, targets=targets)[0]
+    return run_rollouts(model, tokenizer, num_rollouts=1, targets=targets)[0]

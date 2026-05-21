@@ -3,8 +3,8 @@ import re
 import textwrap
 from pathlib import Path
 
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from game import pick_word, score_guess
 
@@ -118,16 +118,10 @@ def main() -> None:
         help="Maximum reasoning characters to print per turn (<= 0 means no limit).",
     )
     parser.add_argument(
-        "--max-model-len",
+        "--gpu",
         type=int,
-        default=6144,
-        help="vLLM max_model_len; lower this if KV cache initialization fails.",
-    )
-    parser.add_argument(
-        "--gpu-memory-utilization",
-        type=float,
-        default=0.90,
-        help="Fraction of GPU memory reserved by vLLM for weights + KV cache.",
+        default=0,
+        help="Physical GPU id to load the checkpoint on.",
     )
     args = parser.parse_args()
 
@@ -141,17 +135,12 @@ def main() -> None:
 
     _print_section("Loading model")
     tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir))
-    llm = LLM(
-        model=str(checkpoint_dir),
-        dtype="bfloat16",
-        enforce_eager=True,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+    model = AutoModelForCausalLM.from_pretrained(
+        str(checkpoint_dir),
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map={"": f"cuda:{args.gpu}"} if torch.cuda.is_available() else "cpu",
     )
-    sampling_params = SamplingParams(
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-    )
+    model.eval()
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -161,6 +150,9 @@ def main() -> None:
     _print_section("Game start")
     print(f"Target word: {target.upper()}")
 
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    do_sample = args.temperature > 0.0
+
     solved = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
         prompt = tokenizer.apply_chat_template(
@@ -169,8 +161,19 @@ def main() -> None:
             add_generation_prompt=True,
             enable_thinking=True,
         )
-        output = llm.generate([prompt], sampling_params=sampling_params)[0]
-        response = output.outputs[0].text.strip()
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=args.max_tokens,
+                do_sample=do_sample,
+                temperature=args.temperature if do_sample else None,
+                pad_token_id=pad_id,
+            )
+
+        new_tokens = output_ids[0][inputs["input_ids"].shape[-1]:]
+        response = tokenizer.decode(new_tokens, skip_special_tokens=False).strip()
 
         reasoning, answer_text = _split_reasoning_and_answer(response)
         guess = _extract_guess(answer_text if answer_text else response)

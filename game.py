@@ -5,8 +5,14 @@ _WORDS_FILE = Path(__file__).parent / "words.txt"
 
 
 def pick_word() -> str:
+    return pick_words(1)[0]
+
+
+def pick_words(n: int) -> list[str]:
+    if n <= 0:
+        return []
     words = [line.strip() for line in _WORDS_FILE.read_text().splitlines() if line.strip()]
-    return random.choice(words)
+    return random.choices(words, k=n)
 
 
 def score_guess(word: str, guess: str) -> list[str]:

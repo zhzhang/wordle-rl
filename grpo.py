@@ -3,7 +3,7 @@
 Given a batch of rollouts (tokens, mask, sampling logprobs, scores), this
 module runs one optimizer step on a HuggingFace policy model using a
 PPO/GRPO-style clipped surrogate objective with importance-sampling ratios
-between the rollout policy (vLLM) and the current trainable policy.
+between the rollout policy and the current trainable policy.
 
 Memory-saving choices for a 4B model on a single GPU:
   * Trainable parameters are restricted to a small LoRA adapter so the
@@ -150,7 +150,6 @@ def grpo_step(
     total_loss_acc = 0.0
     total_ratio_acc = 0.0
     total_clip_frac_acc = 0.0
-    total_kl_acc = 0.0
     total_entropy_acc = 0.0
 
     # Pre-compute denominator (total trainable tokens across the group) so
@@ -204,8 +203,6 @@ def grpo_step(
             clipped_flag = ((ratio < 1.0 - config.clip_eps) |
                             (ratio > 1.0 + config.clip_eps)).float()
             total_clip_frac_acc += float((clipped_flag * loss_mask).sum().item())
-            # Approximate KL = E[ -log_ratio ] for diagnostics only.
-            total_kl_acc += float((-log_ratio * loss_mask).sum().item())
             total_entropy_acc += float((entropy * loss_mask).sum().item())
             total_tokens += int(tok_count.item())
 
@@ -224,7 +221,6 @@ def grpo_step(
         "loss": total_loss_acc / n,
         "mean_ratio": total_ratio_acc / n,
         "clip_frac": total_clip_frac_acc / n,
-        "approx_kl": total_kl_acc / n,
         "entropy": total_entropy_acc / n,
         "grad_norm": float(grad_norm),
         "trained_tokens": float(total_tokens),
