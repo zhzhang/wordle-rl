@@ -54,12 +54,19 @@ def _normalize_advantages(scores: list[int]) -> list[float]:
     return [(s - mean) / std for s in scores]
 
 
-def load_policy(model_id: str, config: GRPOConfig):
+def load_policy(model_id: str, config: GRPOConfig, *, device: int | str | None = None):
     """Load the trainable policy model (optionally with a LoRA adapter)."""
+    if device is None:
+        device_map = "cuda"
+    elif isinstance(device, int):
+        device_map = {"": f"cuda:{device}"}
+    else:
+        device_map = {"": device}
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype=config.dtype,
-        device_map="cuda",
+        device_map=device_map,
     )
     if config.grad_checkpointing:
         # `use_cache` must be disabled with gradient checkpointing or HF warns

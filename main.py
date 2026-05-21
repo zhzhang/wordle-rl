@@ -14,17 +14,18 @@ import traceback
 # the linker cache. This must be set before torch/triton import.
 os.environ.setdefault("TRITON_LIBCUDA_PATH", "/usr/lib/x86_64-linux-gnu")
 
-import torch
-import wandb
-from transformers import AutoTokenizer
-
-from grpo import GRPOConfig, _normalize_advantages, grpo_step, load_policy
-from rollout_worker import worker_main
+# NOTE: do NOT import torch / wandb / transformers / grpo here. With
+# multiprocessing "spawn", the rollout worker child re-imports this module
+# (`__main__`) before running `worker_main`; a top-level `import torch`
+# would initialize a cuda:0 context in that child while vLLM is pinned to
+# cuda:1, causing device-mismatch errors during graph capture.
 
 MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
 
 
 def _report_mem(tag: str) -> None:
+    import torch
+
     if not torch.cuda.is_available():
         return
     alloc = torch.cuda.memory_allocated() / 1e9
@@ -57,6 +58,8 @@ class _SnapshotSaver:
         }
 
     def save(self, policy, tokenizer, out_dir: str) -> None:
+        import torch
+
         if os.path.isdir(out_dir):
             shutil.rmtree(out_dir)
         os.makedirs(out_dir, exist_ok=True)
@@ -101,6 +104,8 @@ class RolloutWorker:
         gpu_memory_utilization: float,
         max_model_len: int,
     ):
+        from rollout_worker import worker_main
+
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=True)
         self._proc = ctx.Process(
@@ -236,22 +241,45 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        raise RuntimeError(
-            "This training script expects at least two CUDA GPUs: one for "
-            "the HF training policy and one for the vLLM rollout engine. "
-            f"Detected {torch.cuda.device_count()} GPU(s)."
-        )
     if args.train_gpu == args.rollout_gpu:
         raise ValueError(
             "--train-gpu and --rollout-gpu must point at different physical "
             f"GPUs (got both == {args.train_gpu})."
         )
 
-    # The training process keeps the full CUDA topology visible so the HF
-    # policy can land on `train_gpu`. The rollout worker masks
-    # CUDA_VISIBLE_DEVICES inside its own process so vLLM only sees
-    # `rollout_gpu`.
+    print(
+        f"=== Spawning vLLM rollout worker on GPU {args.rollout_gpu} "
+        f"(this may take a minute) ===",
+        flush=True,
+    )
+    # Spawn *before* `import torch` initializes cuda:0 in this process.
+    # The worker subprocess also re-imports this file; keeping torch out of
+    # module scope prevents it from grabbing cuda:0 there too.
+    rollout_worker = RolloutWorker(
+        gpu_id=args.rollout_gpu,
+        model_id=MODEL_ID,
+        gpu_memory_utilization=args.vllm_mem,
+        max_model_len=args.max_model_len,
+    )
+
+    import torch
+    import wandb
+    from transformers import AutoTokenizer
+
+    from grpo import GRPOConfig, _normalize_advantages, grpo_step, load_policy
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        rollout_worker.shutdown()
+        raise RuntimeError(
+            "This training script expects at least two CUDA GPUs: one for "
+            "the HF training policy and one for the vLLM rollout engine. "
+            f"Detected {torch.cuda.device_count()} GPU(s)."
+        )
+
+    # Pin the HF training policy to `train_gpu`. The rollout worker pins
+    # vLLM to `rollout_gpu` via a custom worker (see rollout_worker.py);
+    # we keep the full CUDA topology visible in both processes because
+    # CUDA_VISIBLE_DEVICES does not reliably isolate GPUs here.
     torch.cuda.set_device(args.train_gpu)
 
     wandb_mode = args.wandb_mode
@@ -295,23 +323,11 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     print(
-        f"=== Spawning vLLM rollout worker on GPU {args.rollout_gpu} "
-        f"(this may take a minute) ===",
-        flush=True,
-    )
-    rollout_worker = RolloutWorker(
-        gpu_id=args.rollout_gpu,
-        model_id=MODEL_ID,
-        gpu_memory_utilization=args.vllm_mem,
-        max_model_len=args.max_model_len,
-    )
-
-    print(
         f"\n=== Loading HF training policy (LoRA) on GPU {args.train_gpu} ===",
         flush=True,
     )
     cfg = GRPOConfig(lr=args.lr, clip_eps=args.clip_eps)
-    policy = load_policy(MODEL_ID, cfg)
+    policy = load_policy(MODEL_ID, cfg, device=args.train_gpu)
     optimizer = torch.optim.AdamW(
         (p for p in policy.parameters() if p.requires_grad),
         lr=cfg.lr,

@@ -2,10 +2,14 @@
 
 The parent training process drives the worker over a ``multiprocessing.Pipe``
 with a small command protocol. Keeping vLLM in its own process lets us pin
-it to a specific GPU via ``CUDA_VISIBLE_DEVICES`` without affecting the
-training process, and the worker stays resident across iterations so we can
-hot-reload weights in place rather than tearing the engine down every time
-we want fresh samples.
+it to a specific physical GPU without affecting the training process, and
+the worker stays resident across iterations so we can hot-reload weights in
+place rather than tearing the engine down every time we want fresh samples.
+
+GPU placement uses a custom vLLM worker that binds to ``cuda:{gpu_id}``
+directly. ``CUDA_VISIBLE_DEVICES`` is intentionally *not* used: in many
+container / multi-tenant setups it does not isolate GPUs (``CVD=1`` can
+still land on physical device 0), while ``torch.device("cuda:1")`` works.
 
 Protocol (parent -> worker):
     ("rollouts", {"num_rollouts": int, "targets": list[str] | None,
@@ -25,17 +29,36 @@ import glob
 import os
 import traceback
 
+# Env var read by vllm_pinned_worker.PinnedGpuWorker inside EngineCore.
+ROLLOUT_PHYSICAL_GPU_ENV = "ROLLOUT_PHYSICAL_GPU"
+PINNED_WORKER_CLS = "vllm_pinned_worker.PinnedGpuWorker"
 
-def _build_llm(model_id: str, gpu_memory_utilization: float, max_model_len: int):
+
+def _build_llm(
+    model_id: str,
+    gpu_id: int,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+):
     import torch
     from vllm import LLM
 
+    os.environ[ROLLOUT_PHYSICAL_GPU_ENV] = str(gpu_id)
+
+    # NOTE on `enforce_eager`: leaving it at the vLLM default (False)
+    # lets the engine capture CUDA graphs for the decode path, which is
+    # a large win for small models like Qwen3-4B (~1.5-2x throughput).
+    # This is safe with our hot-reload flow because vLLM's
+    # `model.load_weights(...)` uses `param.data.copy_(...)` -- the
+    # parameter tensor addresses don't change across reloads, so any
+    # captured graphs continue to point at the same memory and just
+    # see new values.
     return LLM(
         model=model_id,
         dtype="bfloat16" if torch.cuda.is_available() else "float32",
         gpu_memory_utilization=gpu_memory_utilization,
-        enforce_eager=True,
         max_model_len=max_model_len,
+        worker_cls=PINNED_WORKER_CLS,
     )
 
 
@@ -77,7 +100,7 @@ def _resolve_vllm_model(llm):
     )
 
 
-def _hot_reload_weights(llm, snapshot_dir: str) -> None:
+def _hot_reload_weights(llm, gpu_id: int, snapshot_dir: str) -> None:
     """Stream weights from a Qwen3 checkpoint directory into the running
     vLLM model without recreating the engine."""
     import torch
@@ -95,7 +118,7 @@ def _hot_reload_weights(llm, snapshot_dir: str) -> None:
             pass
 
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(gpu_id)
 
 
 def worker_main(
@@ -111,11 +134,23 @@ def worker_main(
     This function MUST run before any torch / vLLM import in this process,
     which is why the module is intentionally free of top-level GPU imports.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ[ROLLOUT_PHYSICAL_GPU_ENV] = str(gpu_id)
+    # Do not set CUDA_VISIBLE_DEVICES: in this environment it does not
+    # isolate GPUs and causes vLLM to land on physical device 0 regardless
+    # of the requested index. Pin via vllm_pinned_worker instead.
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    # See main.py for the rationale. The child is a fresh spawn so we have
-    # to set this here too, before vLLM imports triton.
     os.environ.setdefault("TRITON_LIBCUDA_PATH", "/usr/lib/x86_64-linux-gnu")
+    # Isolate torch.compile artifacts per physical GPU so a cache built
+    # while running on cuda:0 is not replayed on cuda:1.
+    os.environ["VLLM_CACHE_ROOT"] = os.path.join(
+        os.path.expanduser("~/.cache/vllm"), f"physical_gpu_{gpu_id}"
+    )
+
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
 
     try:
         from transformers import AutoTokenizer
@@ -123,7 +158,7 @@ def worker_main(
         from agent import run_rollouts
 
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        llm = _build_llm(model_id, gpu_memory_utilization, max_model_len)
+        llm = _build_llm(model_id, gpu_id, gpu_memory_utilization, max_model_len)
         conn.send(("ready", None))
     except Exception as exc:
         traceback.print_exc()
@@ -151,7 +186,7 @@ def worker_main(
                     )
                     conn.send(("ok", results))
                 elif cmd == "reload_weights":
-                    _hot_reload_weights(llm, payload["snapshot_dir"])
+                    _hot_reload_weights(llm, gpu_id, payload["snapshot_dir"])
                     conn.send(("ok", None))
                 elif cmd == "shutdown":
                     conn.send(("ok", None))
