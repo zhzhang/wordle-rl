@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import multiprocessing as mp
 import os
 import shutil
@@ -21,6 +22,60 @@ os.environ.setdefault("TRITON_LIBCUDA_PATH", "/usr/lib/x86_64-linux-gnu")
 # cuda:1, causing device-mismatch errors during graph capture.
 
 MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
+
+
+def _write_rollout_token_viz(
+    tokenizer,
+    rollout,
+    json_path: str,
+    html_path: str,
+) -> None:
+    pairs = [
+        [tokenizer.decode([token_id], skip_special_tokens=False), mask]
+        for token_id, mask in zip(rollout.tokens, rollout.mask)
+    ]
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(pairs, f, ensure_ascii=False, indent=2)
+
+    pairs_json = json.dumps(pairs, ensure_ascii=False).replace("<", "\\u003c")
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html, body {{ margin: 0; height: 100%; overflow: hidden; }}
+.scroll {{ display: flex; overflow-x: auto; height: 100%; align-items: stretch; }}
+.cell {{ flex: 0 0 auto; display: flex; flex-direction: column; border-right: 1px solid #ccc; }}
+.token, .mask {{ padding: 4px 6px; font-family: monospace; font-size: 12px; }}
+.token {{ white-space: pre-wrap; word-break: break-all; border-bottom: 1px solid #eee; }}
+.mask-0 {{ background: #fee; }}
+.mask-1 {{ background: #efe; }}
+</style>
+</head>
+<body>
+<div class="scroll" id="root"></div>
+<script>
+const pairs = {pairs_json};
+const root = document.getElementById("root");
+for (const [token, mask] of pairs) {{
+  const cell = document.createElement("div");
+  cell.className = "cell";
+  const tok = document.createElement("div");
+  tok.className = "token";
+  tok.textContent = token;
+  const mk = document.createElement("div");
+  mk.className = "mask mask-" + mask;
+  mk.textContent = mask;
+  cell.appendChild(tok);
+  cell.appendChild(mk);
+  root.appendChild(cell);
+}}
+</script>
+</body>
+</html>
+"""
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
 
 
 def _report_mem(tag: str) -> None:
@@ -368,6 +423,23 @@ def main() -> None:
                     all_rollouts.extend(group)
                     all_advantages.extend(g_advs)
                     group_scores.append(g_scores)
+                    if iteration == 1 and group:
+                        r0 = group[0]
+                        json_path = os.path.join(
+                            os.path.dirname(__file__) or ".",
+                            "rollout_token_debug.json",
+                        )
+                        html_path = os.path.join(
+                            os.path.dirname(__file__) or ".",
+                            "rollout_token_debug.html",
+                        )
+                        _write_rollout_token_viz(
+                            tokenizer, r0, json_path, html_path
+                        )
+                        with open(json_path, encoding="utf-8") as f:
+                            print(f.read(), flush=True)
+                        print(f"[iter 1 first rollout] wrote {html_path}", flush=True)
+                    return
                 rollout_dt = time.time() - t0
 
                 t1 = time.time()

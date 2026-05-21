@@ -14,7 +14,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
         correct  - right letter, right position
         present  - right letter, wrong position
         absent   - letter not in the word
-    - Reply with: GUESS: <word>
+    - Reply with exactly your next guess, no other text.
 """)
 
 
@@ -186,9 +186,10 @@ def run_rollouts(
             feedback = _format_feedback(guess, scores)
             print(f"Rollout {state.rollout_idx + 1} attempt {attempt_num}: {guess.upper()} -> {feedback}")
 
+            state.score = 2 * state.total_correct + state.total_present
             if all(s == "correct" for s in scores):
                 unused = MAX_ATTEMPTS - attempt_num
-                state.score = 12 * (unused + 1)
+                state.score += 12 * unused
                 state.done = True
                 print(
                     f"Rollout {state.rollout_idx + 1} solved in {attempt_num} attempt(s). "
@@ -197,7 +198,6 @@ def run_rollouts(
                 continue
 
             if attempt_num == MAX_ATTEMPTS:
-                state.score = 2 * state.total_correct + state.total_present
                 state.done = True
                 print(
                     f"Rollout {state.rollout_idx + 1} out of attempts. "
